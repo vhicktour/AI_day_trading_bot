@@ -17,6 +17,9 @@ from train_dqn import DQNAgent  # Agent that uses the DQN model
 from market_analyzer import MarketAnalyzer  # For analyzing the market
 from market_exporter import MarketDataExporter  # For exporting market data
 from pairs_manager import PairsManager  # For managing trading pairs
+from trading_chat import TradingChat
+from models.signal_model import SignalModel
+
 
 # Set up logging configuration
 logging.basicConfig(
@@ -51,6 +54,7 @@ try:
     data_exporter = MarketDataExporter(fetcher)  # Data exporter for exporting market data
     pairs_manager = PairsManager(fetcher, config)  # Pairs manager to handle trading pairs
     logger.info("Successfully initialized all components")  # Log success message
+    trading_chat = TradingChat(ai_signal_generator, fetcher, pairs_manager)
 except Exception as e:
     logger.error(f"Error initializing components: {str(e)}")  # Log error message
     sys.exit(1)  # Exit the program if initialization fails
@@ -277,16 +281,30 @@ def trade_bot():
         long_window=config.get('long_window', 20)
     )
     executor = TradeExecutor(config)
-        
-    use_dqn = config.get('use_dqn', False)
+    signal_model = SignalModel(config)  # Add SignalModel initialization
+    
+    # Trade tracking initialization
+    last_trade_time = None
+    min_trade_interval = config.get('timeframe', 60)
+    daily_trades = 0
+    daily_loss = 0
+    initial_balance = None
+    max_daily_trades = config['risk_management']['max_daily_trades']
+    max_daily_loss = config['risk_management']['max_daily_loss']
+    trade_amount = config['trade_amount']
+    stop_loss_pct = config['risk_management']['stop_loss_percentage']
+    take_profit_pct = config['risk_management']['take_profit_percentage']
+    
+    # DQN model initialization
+    use_dqn = config.get('use_dqn', True)
     if use_dqn:
         state_size = 10
         action_size = 3
         agent = DQNAgent(state_size, action_size)
         agent.load("dqn_trading_model.keras")
         logger.info("Loaded DQN model for trading decisions")
-    
-    # Update timeframe handling
+
+    # Timeframe configuration
     timeframe_seconds = config.get('timeframe', 60)
     interval_map = {
         60: '1m',
@@ -297,50 +315,245 @@ def trade_bot():
         14400: '4h',
         86400: '1d'
     }
-    granularity = interval_map.get(timeframe_seconds, '1m')  # Default to '1m' if not found
-
+    granularity = interval_map.get(timeframe_seconds, '1m')
     data_limit = config.get('data_limit', 100)
     
+    def calculate_rsi(prices, period=14):
+        """Calculate RSI indicator."""
+        prices = pd.Series(prices)
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1]
+
+    def check_rsi_conditions(data):
+        """Check if RSI is in overbought or oversold territory."""
+        try:
+            rsi_value = calculate_rsi(data['close'].values, period=14)
+            if rsi_value >= config['alerts']['rsi_overbought']:
+                return 'sell'
+            elif rsi_value <= config['alerts']['rsi_oversold']:
+                return 'buy'
+            return None
+        except Exception as e:
+            logger.error(f"Error calculating RSI: {e}")
+            return None
+
+    def can_trade():
+        """Check if trading is allowed based on all conditions."""
+        nonlocal last_trade_time, daily_trades, daily_loss, initial_balance
+        current_time = time.time()
+        
+        if daily_trades >= max_daily_trades:
+            logger.info("Daily trade limit reached")
+            return False
+        
+        if initial_balance and daily_loss >= (initial_balance * max_daily_loss):
+            logger.info("Daily loss limit reached")
+            return False
+            
+        if last_trade_time and (current_time - last_trade_time) < min_trade_interval:
+            return False
+            
+        if trade_amount < config['trading_rules']['min_order_size']:
+            logger.info("Trade amount below minimum order size")
+            return False
+            
+        if trade_amount > config['trading_rules']['max_order_size']:
+            logger.info("Trade amount exceeds maximum order size")
+            return False
+            
+        return True
+    def execute_trade_with_safety(signal, current_price):
+        """Execute trade with all safety checks and order management."""
+        nonlocal last_trade_time, daily_trades, daily_loss
+        
+        try:
+            # Calculate stop loss and take profit prices
+            stop_loss_price = current_price * (1 - stop_loss_pct) if signal == "buy" else current_price * (1 + stop_loss_pct)
+            take_profit_price = current_price * (1 + take_profit_pct) if signal == "buy" else current_price * (1 - take_profit_pct)
+            
+            # Execute main trade
+            order = executor.execute_trade(signal)
+            
+            if order and order.get('status') == 'closed':
+                last_trade_time = time.time()
+                daily_trades += 1
+                
+                try:
+                    if signal == "buy":
+                        # Place stop loss order
+                        executor.exchange.create_order(
+                            symbol=current_pair,
+                            type='stop_loss_limit',
+                            side='sell',
+                            amount=trade_amount,
+                            price=stop_loss_price,
+                            params={'stopPrice': stop_loss_price}
+                        )
+                        
+                        # Place take profit order
+                        executor.exchange.create_order(
+                            symbol=current_pair,
+                            type='limit',
+                            side='sell',
+                            amount=trade_amount,
+                            price=take_profit_price
+                        )
+                except Exception as e:
+                    logger.error(f"Error placing stop loss/take profit orders: {e}")
+                
+                # Log trade details
+                logger.info(f"Trade executed: {signal.upper()} {current_pair}")
+                logger.info(f"Order details: Price=${order.get('price', 0):.4f}, "
+                          f"Amount={order.get('amount', 0):.8f}")
+                logger.info(f"Stop Loss: ${stop_loss_price:.4f}")
+                logger.info(f"Take Profit: ${take_profit_price:.4f}")
+                
+                # Print trade confirmation
+                print(f"\nTrade executed successfully!")
+                print(f"Type: {signal.upper()}")
+                print(f"Price: ${order.get('price', 0):.4f}")
+                print(f"Amount: {order.get('amount', 0):.8f}")
+                print(f"Value: ${order.get('cost', 0):.2f}")
+                print(f"Stop Loss: ${stop_loss_price:.4f}")
+                print(f"Take Profit: ${take_profit_price:.4f}")
+                
+                return True
+            return False
+            
+        except Exception as e:
+            logger.error(f"Trade execution error: {e}")
+            print(f"Error executing trade: {e}")
+            return False
+
+    def check_signal_model_opportunity(data):
+        """Check for high-probability trading opportunities using SignalModel."""
+        try:
+            # Get signal and confidence from SignalModel
+            signal, confidence = signal_model.generate_signal(data)
+            
+            if signal != 'hold' and confidence >= 0.8:  # Higher threshold for signal model
+                # Log detailed analysis
+                signal_model.log_trade_opportunity(data, signal, confidence)
+                
+                # Calculate risk/reward ratio
+                current_price = float(data['close'].iloc[-1])
+                if signal == 'buy':
+                    risk = current_price * stop_loss_pct
+                    reward = current_price * take_profit_pct
+                else:
+                    risk = current_price * take_profit_pct
+                    reward = current_price * stop_loss_pct
+                
+                risk_reward_ratio = reward / risk
+                
+                # Only return signal if risk/reward is favorable
+                if risk_reward_ratio >= 1.5:
+                    return signal, confidence
+                
+            return None, 0
+            
+        except Exception as e:
+            logger.error(f"Error checking signal model opportunity: {e}")
+            return None, 0
+        
+     # Initialize balance tracking
+    try:
+        balance = executor.exchange.fetch_balance()
+        initial_balance = float(balance['total'].get('USDT', 0))
+        logger.info(f"Initial balance: ${initial_balance:.2f} USDT")
+    except Exception as e:
+        logger.error(f"Error fetching initial balance: {e}")
+        initial_balance = float(config['initial_investment'])
+    
+    # Main trading loop
     while running:
         try:
+            # Reset daily counters at market open
+            if datetime.now().hour == 0 and datetime.now().minute == 0:
+                daily_trades = 0
+                daily_loss = 0
+            
             symbol = current_pair
             data = fetcher.get_latest_data(symbol, granularity=granularity, data_limit=data_limit)
-            if data is None:
+            if data is None or data.empty:
                 time.sleep(timeframe_seconds)
                 continue
-    
+
+            # First check SignalModel for high-probability trades
+            signal_model_signal, signal_model_confidence = check_signal_model_opportunity(data)
+            
+            if signal_model_signal and can_trade():
+                print(f"\nHigh-probability trade detected by SignalModel:")
+                print(f"Signal: {signal_model_signal.upper()}")
+                print(f"Confidence: {signal_model_confidence * 100:.1f}%")
+                
+                current_price = float(data['close'].iloc[-1])
+                if execute_trade_with_safety(signal_model_signal, current_price):
+                    print("High-probability trade executed successfully!")
+                    continue  # Skip regular signal processing
+
+            # Get all trading signals
             ai_signal = ai_signal_generator.get_ai_signal(data) if config['use_ai_signals'] else None
             dqn_signal = agent.act(data['close'][-10:].values.reshape(1, -1)) if use_dqn else None
             dqn_signal = {0: "hold", 1: "buy", 2: "sell"}.get(dqn_signal, "hold")
-    
+            
             ma_signals = strategy.generate_signals(data)
             ma_final_signal = "buy" if ma_signals['pre_growth'].iloc[-1] == 1 else "sell" if ma_signals['pre_dump'].iloc[-1] == 1 else "hold"
-    
-            final_signal = "hold"
-            if ai_signal == dqn_signal and ai_signal is not None:
+            
+            rsi_signal = check_rsi_conditions(data)
+
+            # Combine all signals
+            signals = [s for s in [ai_signal, dqn_signal, ma_final_signal, rsi_signal] if s is not None]
+            
+            # Determine final signal
+            if not signals:
+                final_signal = "hold"
+            elif ai_signal == dqn_signal and ai_signal is not None:
                 final_signal = ai_signal
-            elif "buy" in [ai_signal, dqn_signal, ma_final_signal]:
+            elif signals.count("buy") >= 2:
                 final_signal = "buy"
-            elif "sell" in [ai_signal, dqn_signal, ma_final_signal]:
+            elif signals.count("sell") >= 2:
                 final_signal = "sell"
-    
+            else:
+                final_signal = "hold"
+
+            # Display AI suggestion
             suggestion_message = ai_trade_suggestion_message(final_signal)
             if suggestion_message:
                 print(suggestion_message)
-    
+
+            # Get AI confidence and current price
             ai_confidence = ai_signal_generator.get_confidence(data)
-            if ai_confidence >= confidence_threshold:
-                logger.info(f"High confidence signal: {final_signal} ({ai_confidence:.2f})")
-                print(f"AI Confidence is high ({ai_confidence * 100:.1f}%). Executing {final_signal} trade.")
-                executor.execute_trade(final_signal)
+            print(f"AI Confidence: {ai_confidence * 100:.1f}%")
+            current_price = float(data['close'].iloc[-1])
+            
+            # Execute trade if conditions are met
+            if final_signal in ["buy", "sell"] and ai_confidence >= confidence_threshold:
+                if can_trade():
+                    logger.info(f"High confidence signal: {final_signal} ({ai_confidence:.2f})")
+                    print(f"Executing {final_signal.upper()} trade with {ai_confidence * 100:.1f}% confidence")
+                    print(f"Current price: ${current_price:.4f}")
+                    
+                    if execute_trade_with_safety(final_signal, current_price):
+                        print("Trade executed successfully!")
+                    else:
+                        print("Trade execution failed. See logs for details.")
+                else:
+                    print("Trade skipped: Trading limits or restrictions in effect")
             else:
-                print(f"AI Confidence is low ({ai_confidence * 100:.1f}%). Trade suggestion only: {final_signal}.")
-    
+                if final_signal != "hold":
+                    print(f"Trade suggestion only: {final_signal} (Confidence too low or signal unclear)")
+
             time.sleep(timeframe_seconds)
                 
         except Exception as e:
             logger.error(f"Error in trade_bot: {e}")
-            time.sleep(timeframe_seconds)
+            print(f"Error in trading loop: {e}")
+            time.sleep(timeframe_seconds)   
     
 def start_bot():
     global running

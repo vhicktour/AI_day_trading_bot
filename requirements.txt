@@ -1,0 +1,8 @@
+numpy==1.26.0
+pandas
+scikit-learn
+ccxt
+5openai==0.28
+tensorflow==2.18.0
+keras
+ta-lib==0.4.32
