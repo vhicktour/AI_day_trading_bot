@@ -1,0 +1,51 @@
+{
+    "api_key": "your_binance_api_key_here",
+    "api_secret": "your_binance_api_secret_here",
+    "openai_key": "your_openai_api_key_here",
+    "initial_investment": 50,
+    "trade_pair": "BTC/USDT",
+    "trade_amount": 0.001,
+    "use_ai_signals": true,
+    "use_dqn": true,
+    "short_window": 5,
+    "long_window": 20,
+    "timeframe": 60,
+    "data_limit": 100,
+    "pairs_config": {
+      "quote_currencies": ["USDT", "USD", "BTC", "ETH"],
+      "min_volume": 10000,
+      "excluded_pairs": [],
+      "preferred_pairs": [
+        "BTC/USDT",
+        "ETH/USDT",
+        "SOL/USDT",
+        "DOGE/USDT",
+        "XRP/USDT",
+        "BNB/USDT",
+        "ADA/USDT",
+        "AVAX/USDT",
+        "MATIC/USDT",
+        "DOT/USDT"
+      ]
+    },
+    "trading_rules": {
+      "min_order_size": 10,
+      "max_order_size": 1000,
+      "min_price": 0.00000001,
+      "max_leverage": 1,
+      "default_slippage": 0.001
+    },
+    "risk_management": {
+      "max_position_size": 0.1,
+      "stop_loss_percentage": 0.02,
+      "take_profit_percentage": 0.05,
+      "max_daily_trades": 10,
+      "max_daily_loss": 0.05
+    },
+    "alerts": {
+      "price_change_threshold": 0.05,
+      "volume_spike_threshold": 3,
+      "rsi_overbought": 70,
+      "rsi_oversold": 30
+    }
+  }
