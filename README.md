@@ -53,6 +53,12 @@ cd AI_day_trading_bot
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+python3 -m venv venv #MacOS
+source venv/bin/activate
+
+
+
 ```
 
 3. Install required packages:
