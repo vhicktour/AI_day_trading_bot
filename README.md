@@ -9,6 +9,17 @@ An advanced cryptocurrency trading bot that combines artificial intelligence, de
 - Real-time market sentiment analysis
 - Dynamic confidence-based trade execution
 - Natural language interaction for market insights
+- Enhanced AI chat functionality for trading insights
+- Improved signal generation accuracy
+- Real-time trading recommendations
+
+### 💰 Balance Management (New in v1.2)
+- Real-time balance monitoring
+- Pre-trade balance validation
+- Dynamic trade size adjustment
+- Balance-based safety checks
+- Automated trade restriction on low balance
+- Clear balance status feedback
 
 ### 📊 Advanced Market Analysis
 - Real-time market data monitoring
@@ -16,12 +27,20 @@ An advanced cryptocurrency trading bot that combines artificial intelligence, de
 - Volume profile analysis
 - Price action patterns recognition
 - Top movers and market momentum tracking
+- Dynamic support and resistance detection
+- Advanced technical indicators integration
+- Profit potential calculation
+- Enhanced price pattern recognition
 
 ### 📈 Multiple Trading Strategies
 - Moving Average Crossover
 - Deep Q-Learning Network (DQN)
 - AI signal generation
 - Strategy aggregation for improved accuracy
+- SignalModel for improved analysis (v1.1)
+- Pattern recognition system
+- Enhanced strategy combination
+- Profit-focused parameters
 
 ### 🔄 Dynamic Pair Management
 - Support for all major cryptocurrency pairs
@@ -34,6 +53,10 @@ An advanced cryptocurrency trading bot that combines artificial intelligence, de
 - Stop-loss and take-profit management
 - Maximum daily loss limits
 - Trading volume restrictions
+- Enhanced balance verification
+- Improved stop-loss placement
+- Real-time risk monitoring
+- Dynamic position sizing
 
 ### 📊 Data Export & Analysis
 - CSV export functionality
@@ -53,12 +76,9 @@ cd AI_day_trading_bot
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-python3 -m venv venv #MacOS
+# MacOS
+python3 -m venv venv
 source venv/bin/activate
-
-
-
 ```
 
 3. Install required packages:
@@ -87,6 +107,20 @@ The bot is configured through `config/config.json`:
     "pairs_config": {
         "quote_currencies": ["USDT", "USD", "BTC", "ETH"],
         "min_volume": 10000
+    },
+    "trading_rules": {
+        "min_order_size": 10,
+        "max_order_size": 1000,
+        "min_price": 0.00000001,
+        "max_leverage": 1,
+        "default_slippage": 0.001
+    },
+    "risk_management": {
+        "max_position_size": 0.1,
+        "stop_loss_percentage": 0.02,
+        "take_profit_percentage": 0.05,
+        "max_daily_trades": 10,
+        "max_daily_loss": 0.05
     }
 }
 ```
@@ -130,7 +164,8 @@ AI_day_trading_bot/
 ├── config/
 │   └── config.json
 ├── models/
-│   └── dqn_model.py
+│   ├── dqn_model.py
+│   └── signal_model.py    # New in v1.1
 ├── scripts/
 │   └── openai_integration.py
 ├── strategies/
@@ -142,9 +177,50 @@ AI_day_trading_bot/
 ├── main.py
 ├── market_analyzer.py
 ├── market_exporter.py
-└── pairs_manager.py
-|__train_dqn.py
+├── pairs_manager.py
+├── train_dqn.py
+└── trading_chat.py       # New in v1.1
 ```
+
+## Version History
+
+### Version 1.2 (Current)
+- Added comprehensive balance management system
+- Enhanced trade execution safety features
+- Improved initialization and error handling
+- Added real-time balance monitoring
+- Implemented balance-based trade validation
+- Fixed component initialization order
+
+### Version 1.1
+- Added SignalModel for improved trade analysis
+- Enhanced trade execution with safety checks
+- Implemented comprehensive technical indicators
+- Added profit-focused trading strategies
+- Improved risk management system
+- Enhanced AI chat functionality
+
+### Version 1.0
+- Initial release
+- Basic trading functionality
+- AI integration
+- Market analysis features
+
+## Safety Features (New in v1.2)
+
+### Balance Management
+- Automatic balance verification before trades
+- Real-time balance monitoring
+- Trade size validation
+- Insufficient funds protection
+- Clear balance status feedback
+
+### Trade Safety
+- Pre-trade balance validation
+- Post-trade balance verification
+- Stop-loss and take-profit confirmation
+- Enhanced error handling
+- Detailed trade logging
 
 ## Contributing
 
