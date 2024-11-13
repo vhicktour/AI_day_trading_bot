@@ -2,8 +2,6 @@
 
 An advanced cryptocurrency trading bot that combines artificial intelligence, deep learning, and traditional trading strategies for automated cryptocurrency trading. Built with Python, it leverages OpenAI's GPT models for market analysis and multiple trading strategies for optimal decision making.
 
-![Trading Bot Banner](https://raw.githubusercontent.com/vhicktour/AI_day_trading_bot/main/docs/images/banner.png)
-
 ## Features
 
 ### 🤖 AI-Powered Trading
