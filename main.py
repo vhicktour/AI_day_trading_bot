@@ -6,58 +6,87 @@ import threading
 import pandas as pd
 import logging
 from datetime import datetime
+import ccxt
 
-# Import custom modules needed for the trading bot
-from utils.data_fetcher import DataFetcher  # For fetching market data
-from strategies.moving_average_strategy import MovingAverageStrategy  # Strategy based on moving averages
-from scripts.openai_integration import AIBasedSignal  # For AI-based trading signals
-from utils.trade_executor import TradeExecutor  # For executing trades
-from models.dqn_model import DQNModel  # Deep Q-Network model for trading decisions
-from train_dqn import DQNAgent  # Agent that uses the DQN model
-from market_analyzer import MarketAnalyzer  # For analyzing the market
-from market_exporter import MarketDataExporter  # For exporting market data
-from pairs_manager import PairsManager  # For managing trading pairs
-from trading_chat import TradingChat
-from models.signal_model import SignalModel
-
-
-# Set up logging configuration
+# Set up logging configuration first
 logging.basicConfig(
-    level=logging.INFO,  # Set logging level to INFO
-    format='%(asctime)s - %(levelname)s - %(message)s',  # Define the logging format
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('trading_bot.log'),  # Log messages to a file named 'trading_bot.log'
-        logging.StreamHandler()  # Also log messages to the console
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)  # Create a logger for this module
+logger = logging.getLogger(__name__)
 
 # Load configuration from JSON file
 try:
     with open('config/config.json') as f:
-        config = json.load(f)  # Load JSON configuration
-    logger.info("Successfully loaded config")  # Log success message
+        config = json.load(f)
+    logger.info("Successfully loaded config")
+    
+    # Define constants after config is loaded
+    MIN_REQUIRED_BALANCE = float(config.get('initial_investment', 50))
+    MIN_TRADE_BALANCE = float(config['trading_rules']['min_order_size'])
+    
 except Exception as e:
-    logger.error(f"Error loading config: {str(e)}")  # Log error message
-    sys.exit(1)  # Exit the program if configuration fails to load
+    logger.error(f"Error loading config: {str(e)}")
+    sys.exit(1)
+
+# Import custom modules after config is loaded
+from utils.data_fetcher import DataFetcher
+from strategies.moving_average_strategy import MovingAverageStrategy
+from scripts.openai_integration import AIBasedSignal
+from utils.trade_executor import TradeExecutor
+from models.dqn_model import DQNModel
+from train_dqn import DQNAgent
+from market_analyzer import MarketAnalyzer
+from market_exporter import MarketDataExporter
+from pairs_manager import PairsManager
+from trading_chat import TradingChat
+from models.signal_model import SignalModel
+
+def check_balance():
+    """Check current balance and verify if it meets minimum requirements."""
+    try:
+        balance = executor.exchange.fetch_balance()
+        available_balance = float(balance['free'].get('USDT', 0))
+        total_balance = float(balance['total'].get('USDT', 0))
+        
+        status = {
+            'available': available_balance,
+            'total': total_balance,
+            'sufficient': available_balance >= MIN_REQUIRED_BALANCE,
+            'can_trade': available_balance >= MIN_TRADE_BALANCE
+        }
+        
+        logger.info(f"Balance check - Available: ${available_balance:.2f} USDT, Total: ${total_balance:.2f} USDT")
+        return status
+        
+    except Exception as e:
+        logger.error(f"Error checking balance: {e}")
+        return None
 
 # Initialize global variables and components
-current_pair = config['trade_pair']  # Set the current trading pair from the config
-running = False  # Flag to indicate if the trading bot is running
-confidence_threshold = 0.7  # Confidence threshold for AI signals
+current_pair = config['trade_pair']
+running = False
+confidence_threshold = 0.7
 
 try:
     # Initialize all components needed for the trading bot
-    fetcher = DataFetcher(config)  # Data fetcher to get market data
-    ai_signal_generator = AIBasedSignal(config['openai_key'], fetcher, current_pair)  # AI-based signal generator
-    market_analyzer = MarketAnalyzer(fetcher)  # Market analyzer for insights
-    data_exporter = MarketDataExporter(fetcher)  # Data exporter for exporting market data
-    pairs_manager = PairsManager(fetcher, config)  # Pairs manager to handle trading pairs
-    logger.info("Successfully initialized all components")  # Log success message
+    fetcher = DataFetcher(config)
+    executor = TradeExecutor(config)
+    ai_signal_generator = AIBasedSignal(config['openai_key'], fetcher, current_pair)
+    market_analyzer = MarketAnalyzer(fetcher)
+    data_exporter = MarketDataExporter(fetcher)
+    pairs_manager = PairsManager(fetcher, config)
     trading_chat = TradingChat(ai_signal_generator, fetcher, pairs_manager)
+    logger.info("Successfully initialized all components")
+    
 except Exception as e:
-    logger.error(f"Error initializing components: {str(e)}")  # Log error message
-    sys.exit(1)  # Exit the program if initialization fails
+    logger.error(f"Error initializing components: {str(e)}")
+    sys.exit(1) # Exit the program if configuration fails to load
+
 
 def view_market_data():
     """Display enhanced market data with pairs manager"""
@@ -276,12 +305,36 @@ def change_pair():
     
 def trade_bot():
     global running, current_pair
+    
+    # First check balance before initializing anything
+    try:
+        balance = executor.exchange.fetch_balance()
+        available_balance = float(balance['free'].get('USDT', 0))
+        
+        if available_balance < config['initial_investment']:
+            logger.warning(f"Insufficient starting balance: ${available_balance:.2f} USDT")
+            print("\n⚠️ Cannot start trading - Insufficient funds!")
+            print(f"Available balance: ${available_balance:.2f} USDT")
+            print(f"Minimum required: ${config['initial_investment']:.2f} USDT")
+            running = False
+            return
+            
+        logger.info(f"Starting trading with balance: ${available_balance:.2f} USDT")
+        print(f"\nInitial balance: ${available_balance:.2f} USDT")
+        
+    except Exception as e:
+        logger.error(f"Error checking balance: {e}")
+        print("\n❌ Could not verify balance. Please check your API connection.")
+        running = False
+        return
+    
+    # Initialize components only if balance check passes
     strategy = MovingAverageStrategy(
         short_window=config.get('short_window', 5),
         long_window=config.get('long_window', 20)
     )
     executor = TradeExecutor(config)
-    signal_model = SignalModel(config)  # Add SignalModel initialization
+    signal_model = SignalModel(config)
     
     # Trade tracking initialization
     last_trade_time = None
@@ -366,11 +419,25 @@ def trade_bot():
             return False
             
         return True
+    
     def execute_trade_with_safety(signal, current_price):
         """Execute trade with all safety checks and order management."""
         nonlocal last_trade_time, daily_trades, daily_loss
         
         try:
+            # Check balance before trade
+            balance = executor.exchange.fetch_balance()
+            available_balance = float(balance['free'].get('USDT', 0))
+            required_amount = current_price * trade_amount
+            
+            # Validate sufficient balance
+            if available_balance < required_amount:
+                logger.warning(f"Insufficient balance for trade: ${available_balance:.2f} USDT available, needed: ${required_amount:.2f} USDT")
+                print(f"\n⚠️ Cannot execute {signal} trade - Insufficient funds!")
+                print(f"Required: ${required_amount:.2f} USDT")
+                print(f"Available: ${available_balance:.2f} USDT")
+                return False
+            
             # Calculate stop loss and take profit prices
             stop_loss_price = current_price * (1 - stop_loss_pct) if signal == "buy" else current_price * (1 + stop_loss_pct)
             take_profit_price = current_price * (1 + take_profit_pct) if signal == "buy" else current_price * (1 - take_profit_pct)
@@ -384,6 +451,15 @@ def trade_bot():
                 
                 try:
                     if signal == "buy":
+                        # Verify balance again after main trade
+                        post_trade_balance = executor.exchange.fetch_balance()
+                        available_amount = float(post_trade_balance['free'].get(current_pair.split('/')[0], 0))
+                        
+                        if available_amount < trade_amount:
+                            logger.error("Insufficient balance for stop loss/take profit orders")
+                            print("\n⚠️ Warning: Could not place stop loss/take profit orders - insufficient balance")
+                            return True  # Main trade succeeded but couldn't place stop loss/take profit
+                        
                         # Place stop loss order
                         executor.exchange.create_order(
                             symbol=current_pair,
@@ -402,18 +478,23 @@ def trade_bot():
                             amount=trade_amount,
                             price=take_profit_price
                         )
+                        
+                        logger.info("Successfully placed stop loss and take profit orders")
+                        
                 except Exception as e:
                     logger.error(f"Error placing stop loss/take profit orders: {e}")
+                    print("\n⚠️ Warning: Error placing stop loss/take profit orders")
+                    print("Please monitor position manually!")
                 
                 # Log trade details
                 logger.info(f"Trade executed: {signal.upper()} {current_pair}")
                 logger.info(f"Order details: Price=${order.get('price', 0):.4f}, "
-                          f"Amount={order.get('amount', 0):.8f}")
+                        f"Amount={order.get('amount', 0):.8f}")
                 logger.info(f"Stop Loss: ${stop_loss_price:.4f}")
                 logger.info(f"Take Profit: ${take_profit_price:.4f}")
                 
                 # Print trade confirmation
-                print(f"\nTrade executed successfully!")
+                print(f"\n✅ Trade executed successfully!")
                 print(f"Type: {signal.upper()}")
                 print(f"Price: ${order.get('price', 0):.4f}")
                 print(f"Amount: {order.get('amount', 0):.8f}")
@@ -421,12 +502,28 @@ def trade_bot():
                 print(f"Stop Loss: ${stop_loss_price:.4f}")
                 print(f"Take Profit: ${take_profit_price:.4f}")
                 
+                # Update balance after trade
+                final_balance = executor.exchange.fetch_balance()
+                new_balance = float(final_balance['free'].get('USDT', 0))
+                print(f"Remaining balance: ${new_balance:.2f} USDT")
+                
                 return True
+                
+            return False
+            
+        except ccxt.InsufficientFunds as e:
+            logger.error(f"Insufficient funds: {e}")
+            print(f"\n❌ Insufficient funds to execute {signal} trade!")
+            return False
+            
+        except ccxt.ExchangeError as e:
+            logger.error(f"Exchange error: {e}")
+            print(f"\n❌ Exchange error: {e}")
             return False
             
         except Exception as e:
             logger.error(f"Trade execution error: {e}")
-            print(f"Error executing trade: {e}")
+            print(f"\n❌ Error executing trade: {e}")
             return False
 
     def check_signal_model_opportunity(data):
@@ -557,14 +654,34 @@ def trade_bot():
     
 def start_bot():
     global running
-    if not running:
-        running = True
-        bot_thread = threading.Thread(target=trade_bot)
-        bot_thread.start()
-        logger.info("Trading bot started")
-        print("Trading bot started.")
-    else:
-        print("Trading bot is already running.")
+    try:
+        # Check balance before starting
+        balance_status = check_balance()
+        if balance_status is None:
+            print("\n❌ Error checking balance. Please verify your API connection.")
+            return False
+        
+        if not balance_status['sufficient']:
+            print("\n⚠️ Insufficient funds to start trading!")
+            print(f"Available balance: ${balance_status['available']:.2f} USDT")
+            print(f"Minimum required: ${MIN_REQUIRED_BALANCE:.2f} USDT")
+            print("\nPlease deposit funds before starting the trading bot.")
+            return False
+        
+        if not running:
+            running = True
+            bot_thread = threading.Thread(target=trade_bot)
+            bot_thread.daemon = True
+            bot_thread.start()
+            logger.info(f"Trading bot started with ${balance_status['available']:.2f} USDT")
+            print(f"\nTrading bot started with {balance_status['available']:.2f} USDT")
+        else:
+            print("Trading bot is already running.")
+            
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
+        print(f"\n❌ Error: Unable to start trading bot. Please check your API keys and connection.")
+        return False
     
 def stop_bot():
     global running
