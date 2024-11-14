@@ -8,6 +8,8 @@ import logging
 from datetime import datetime
 import ccxt
 import talib
+import numpy as np
+
 
 
 # Set up logging configuration
@@ -74,8 +76,10 @@ except Exception as e:
 # Utility Functions
 def check_balance():
     """Check current balance and verify if it meets minimum requirements."""
-    global executor  # Ensures access to 'executor' defined in main script
+    global executor  # Ensure access to 'executor' defined in main script
     try:
+        if executor is None:
+            raise ValueError("Executor is not initialized")
         balance = executor.exchange.fetch_balance()
         available_balance = float(balance['free'].get('USDT', 0))
         total_balance = float(balance['total'].get('USDT', 0))
@@ -363,7 +367,7 @@ def change_pair():
         print(f"Error during pair selection: {e}")
     
 def trade_bot():
-    global running, current_pair
+    global running, current_pair, executor
     
     # First check balance before initializing anything
     try:
@@ -712,8 +716,7 @@ def trade_bot():
             time.sleep(timeframe_seconds)   
     
 def start_bot():
-    global running, executor, daily_trades, daily_loss  # Add executor, daily_trades, and daily_loss here
-
+    global running, executor, daily_trades, daily_loss, config
     try:
         # Initialize executor if not already done
         if 'executor' not in globals() or executor is None:
@@ -726,12 +729,48 @@ def start_bot():
             print("\n❌ Error checking balance. Please verify your API connection.")
             return False
 
-        if not balance_status['sufficient']:
-            print("\n⚠️ Insufficient funds to start trading!")
-            print(f"Available balance: ${balance_status['available']:.2f} USDT")
-            print(f"Minimum required: ${MIN_REQUIRED_BALANCE:.2f} USDT")
-            print("\nPlease deposit funds before starting the trading bot.")
-            return False
+        available_balance = balance_status['available']
+        print(f"\n💰 Current Balance: ${available_balance:.2f} USDT")
+
+        # Prompt for trade amount
+        while True:
+            try:
+                print("\n=== Set Trade Amount ===")
+                print(f"Available Balance: ${available_balance:.2f} USDT")
+                print("Minimum trade: $10.00 USDT")
+                print(f"Maximum trade: ${min(1000, available_balance):.2f} USDT")
+                
+                amount = float(input("\nEnter trade amount in USDT (min $10): $"))
+                
+                if amount < 10:
+                    print("❌ Amount too small. Minimum is $10 USDT")
+                    continue
+                    
+                if amount > min(1000, available_balance):
+                    print(f"❌ Amount too large. Maximum is ${min(1000, available_balance):.2f} USDT")
+                    continue
+                
+                # Update config with new trade amount
+                ticker = executor.exchange.fetch_ticker(config['trade_pair'])
+                current_price = float(ticker['last'])
+                
+                # Calculate quantity in base currency (e.g., BTC)
+                quantity = amount / current_price
+                
+                # Update config
+                config['initial_investment'] = amount
+                config['trade_amount'] = quantity
+                
+                print(f"\n✅ Trade settings:")
+                print(f"Amount per trade: ${amount:.2f} USDT")
+                print(f"Quantity per trade: {quantity:.8f} {config['trade_pair'].split('/')[0]}")
+                
+                confirm = input("\nConfirm these settings? (y/n): ").lower()
+                if confirm == 'y':
+                    break
+                
+            except ValueError:
+                print("❌ Please enter a valid number")
 
         if not running:
             # Reset daily counters
@@ -741,18 +780,18 @@ def start_bot():
             # Start the bot
             running = True
             bot_thread = threading.Thread(target=trade_bot)
-            bot_thread.daemon = True  # Make thread daemon
+            bot_thread.daemon = True
             bot_thread.start()
             
             # Log and display success message
-            logger.info(f"Trading bot started with ${balance_status['available']:.2f} USDT")
+            logger.info(f"Trading bot started with ${amount:.2f} USDT per trade")
             print(f"\n✅ Trading bot started successfully!")
-            print(f"Available balance: ${balance_status['available']:.2f} USDT")
+            print(f"Trading amount: ${amount:.2f} USDT per trade")
+            print(f"Available balance: ${available_balance:.2f} USDT")
             print(f"Daily trade limit: {config['risk_management']['max_daily_trades']} trades")
             print(f"Stop loss: {config['risk_management']['stop_loss_percentage'] * 100}%")
             print(f"Take profit: {config['risk_management']['take_profit_percentage'] * 100}%")
             return True
-            
         else:
             print("\n⚠️ Trading bot is already running.")
             return True
@@ -899,7 +938,7 @@ logger = logging.getLogger(__name__)
 
 def ai_trade_pilot():
     """AI Trade Pilot for profit-focused trading with comprehensive analysis and feedback."""
-    global running, current_pair
+    global running, current_pair, executor
     pilot_running = True
     last_trade_time = None
     min_trade_interval = 300  # 5 minutes between trades
@@ -1151,6 +1190,67 @@ def ai_trade_pilot():
             print(f"\n❌ Error: {e}")
             time.sleep(60)
 
+def test_direct_trade():
+    """Direct trade test with minimal amount."""
+    try:
+        # Get current balance
+        balance = executor.exchange.fetch_balance()
+        initial_usdt = float(balance['free'].get('USDT', 0))
+        print(f"\n💰 Initial USDT: ${initial_usdt:.2f}")
+
+        # Get current market price
+        symbol = config['trade_pair']
+        ticker = executor.exchange.fetch_ticker(symbol)
+        price = float(ticker['last'])
+        print(f"Current {symbol} price: ${price:.8f}")
+
+        # Calculate minimum trade amount (use a very small amount for testing)
+        trade_amount = 0.001  # Minimum trade amount
+        cost_usdt = trade_amount * price
+        print(f"Attempting to buy {trade_amount} {symbol.split('/')[0]} (${cost_usdt:.2f} USDT)")
+
+        if cost_usdt > initial_usdt:
+            print("❌ Insufficient funds for test trade")
+            return
+
+        # Place market buy order directly
+        try:
+            print("\n🚀 Placing market buy order...")
+            order = executor.exchange.create_market_buy_order(
+                symbol,
+                trade_amount,
+                {
+                    'test': False,  # Set to True for test mode
+                    'type': 'market'
+                }
+            )
+            
+            print("\nOrder response:")
+            print(json.dumps(order, indent=2))
+
+            # Check if order was successful
+            if order and order['status'] == 'closed':
+                print("\n✅ Order successful!")
+                print(f"Amount: {order['filled']} {symbol.split('/')[0]}")
+                print(f"Price: ${order['price']:.8f}")
+                print(f"Cost: ${order['cost']:.2f} USDT")
+
+                # Verify balance change
+                new_balance = executor.exchange.fetch_balance()
+                final_usdt = float(new_balance['free'].get('USDT', 0))
+                print(f"\nFinal USDT: ${final_usdt:.2f}")
+                print(f"USDT Change: ${final_usdt - initial_usdt:.2f}")
+            else:
+                print("\n❌ Order not completed")
+
+        except ccxt.InsufficientFunds:
+            print("\n❌ Insufficient funds to execute trade")
+        except Exception as e:
+            print(f"\n❌ Error executing trade: {str(e)}")
+
+    except Exception as e:
+        print(f"\n❌ Test failed: {str(e)}")
+
 
 
 
@@ -1180,6 +1280,7 @@ def menu():
         print("8. 💰 Check Balance")
         print("9. 🤖 Start AI Trade Pilot")
         print("10. ❌ Exit")
+        print("11. Test Direct Trade")
         print("-"*40)
         
         choice = input("Enter your choice: ").strip()
@@ -1262,9 +1363,13 @@ def menu():
                 print("\n✅ Trading bot shutdown complete")
                 print("Thank you for using the trading bot!")
                 break
-                
+
+            elif choice == "11":
+                print("\n=== Testing Direct Trade ===")
+                test_direct_trade()  
+
             else:
-                print("\n❌ Invalid choice. Please enter a number between 1 and 10.")
+                print("\n❌ Invalid choice. Please enter a number between 1 and 11.")
                 
         except Exception as e:
             logger.error(f"Error in menu selection: {e}")

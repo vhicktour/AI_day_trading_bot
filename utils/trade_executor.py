@@ -41,25 +41,24 @@ class TradeExecutor:
         self.daily_trades = 0
         self.daily_loss = 0
         self.initial_balance = None
-        
+
     def check_daily_limits(self):
         """Check if we've exceeded daily trading limits."""
         if self.daily_trades >= self.max_daily_trades:
-            self.logger.warning("Maximum daily trades reached")
+            print("⚠️ Daily trade limit reached")
             return False
             
         if self.daily_loss >= self.max_daily_loss:
-            self.logger.warning("Maximum daily loss reached")
+            print("⚠️ Maximum daily loss reached")
             return False
             
         return True
-        
+
     def get_precise_quantity(self, quantity, symbol):
         """Get quantity with correct precision for the symbol."""
         try:
             market = self.exchange.market(symbol)
             precision = market['precision']['amount']
-            # Convert to string to avoid float precision issues
             return self.exchange.decimal_to_precision(
                 quantity, 
                 rounding_mode=ROUND_DOWN,
@@ -73,51 +72,59 @@ class TradeExecutor:
         """Calculate trade amount respecting all configured limits."""
         try:
             ticker = self.exchange.fetch_ticker(symbol)
-            current_price = Decimal(str(ticker['last']))
+            current_price = float(ticker['last'])
+            
+            # Convert USDT minimums to asset quantity
+            min_order_size_quantity = self.min_order_size / current_price
+            max_order_size_quantity = self.max_order_size / current_price
             
             balance = self.exchange.fetch_balance()
             
             if side == 'buy':
-                usdt_balance = Decimal(str(balance['free'].get('USDT', 0)))
-                # Respect initial investment limit
-                max_usdt = min(
-                    usdt_balance,
-                    Decimal(str(self.config['initial_investment']))
-                )
+                available_usdt = float(balance['free'].get('USDT', 0))
                 
-                # Calculate quantity based on trade_amount setting
-                base_quantity = Decimal(str(self.config['trade_amount']))
+                # Calculate maximum quantity based on available USDT
+                max_possible_quantity = available_usdt / current_price
                 
-                # Ensure we don't exceed position size limits
-                max_position_value = usdt_balance * Decimal(str(self.max_position_size))
-                max_quantity = max_position_value / current_price
+                # Use configured trade amount, but ensure it meets minimums
+                desired_quantity = float(self.config['trade_amount'])
+                quantity = min(desired_quantity, max_possible_quantity)
                 
-                quantity = min(base_quantity, max_quantity)
+                # Ensure quantity meets USDT minimums
+                if (quantity * current_price) < self.min_order_size:
+                    quantity = min_order_size_quantity
                 
+                if (quantity * current_price) > self.max_order_size:
+                    quantity = max_order_size_quantity
+                    
             else:  # sell
                 asset = symbol.split('/')[0]
-                asset_balance = Decimal(str(balance['free'].get(asset, 0)))
-                quantity = min(
-                    asset_balance,
-                    Decimal(str(self.config['trade_amount']))
-                )
+                available_asset = float(balance['free'].get(asset, 0))
+                quantity = min(available_asset, float(self.config['trade_amount']))
+                
+                # Check if sell amount meets minimum USDT value
+                if (quantity * current_price) < self.min_order_size:
+                    print(f"⚠️ Sell amount too small (${quantity * current_price:.2f} USDT)")
+                    return None
             
-            # Get market limits
-            market = self.exchange.market(symbol)
-            min_amount = Decimal(str(market['limits']['amount']['min']))
-            max_amount = Decimal(str(market['limits']['amount']['max']))
-            
-            # Apply limits
-            quantity = max(min(quantity, max_amount), min_amount)
-            
-            # Get precise quantity string
-            precise_quantity = self.get_precise_quantity(float(quantity), symbol)
-            
+            # Get precise quantity
+            precise_quantity = self.get_precise_quantity(quantity, symbol)
             if not precise_quantity:
                 return None
                 
-            return precise_quantity
+            # Verify final amount meets requirements
+            final_usdt_value = float(precise_quantity) * current_price
+            print(f"\n📊 Trade Amount Check:")
+            print(f"Quantity: {precise_quantity} {symbol.split('/')[0]}")
+            print(f"Value: ${final_usdt_value:.2f} USDT")
+            print(f"Minimum Required: ${self.min_order_size:.2f} USDT")
             
+            if final_usdt_value < self.min_order_size:
+                print("❌ Amount too small")
+                return None
+                
+            return precise_quantity
+                
         except Exception as e:
             self.logger.error(f"Error calculating trade amount: {e}")
             return None
@@ -125,86 +132,192 @@ class TradeExecutor:
     def execute_trade(self, signal):
         """Execute trade with all safety checks and limits."""
         if not self.check_daily_limits():
+            print("⚠️ Daily trading limits reached")
             return None
             
         symbol = self.config['trade_pair']
         
         try:
-            # Verify exchange connection
-            self.exchange.check_required_credentials()
+            print(f"\n🔍 DEBUG: Trade Execution Start")
+            print(f"Signal: {signal}")
+            print(f"Symbol: {symbol}")
             
-            # Calculate trade amount
-            quantity = self.calculate_trade_amount(symbol, signal)
-            if not quantity:
-                self.logger.error("Failed to calculate valid trade amount")
+            # Get current market price first
+            ticker = self.exchange.fetch_ticker(symbol)
+            current_price = float(ticker['last'])
+            print(f"Current Market Price: ${current_price:.8f}")
+            
+            # Calculate minimum order size in USDT
+            market = self.exchange.market(symbol)
+            min_amount = float(market['limits']['amount']['min'])
+            min_cost_usdt = min_amount * current_price
+            print(f"Minimum Order Size: {min_amount} {symbol.split('/')[0]} (${min_cost_usdt:.2f} USDT)")
+            
+            # Get balance with explicit error checking
+            try:
+                balance = self.exchange.fetch_balance()
+                available_usdt = float(balance['free'].get('USDT', 0))
+                print(f"Available USDT Balance: ${available_usdt:.2f}")
+            except Exception as e:
+                print(f"❌ Error fetching balance: {e}")
                 return None
+
+            # Calculate trade amount (in base currency)
+            quantity = self.config['trade_amount']  # Direct amount from config
+            required_usdt = quantity * current_price
             
-            # Execute the trade
+            print(f"\n📊 Trade Calculation:")
+            print(f"Attempting to trade: {quantity} {symbol.split('/')[0]}")
+            print(f"Estimated cost: ${required_usdt:.2f} USDT")
+            
             if signal == "buy":
-                order = self.exchange.create_market_buy_order(
-                    symbol,
-                    quantity,
-                    params={
-                        'type': 'market'
-                    }
-                )
-                
-                if order['status'] == 'closed':
-                    entry_price = Decimal(str(order['price']))
-                    stop_loss_price = entry_price * (1 - Decimal(str(self.stop_loss_percentage)))
-                    take_profit_price = entry_price * (1 + Decimal(str(self.take_profit_percentage)))
+                if available_usdt < required_usdt:
+                    print("❌ Insufficient USDT for buy order")
+                    return None
                     
-                    # Place stop loss order
-                    self.exchange.create_order(
-                        symbol,
-                        'stop_loss_limit',
-                        'sell',
-                        quantity,
-                        self.get_precise_quantity(float(stop_loss_price), symbol),
-                        {'stopPrice': float(stop_loss_price)}
+                try:
+                    print("\n🚀 Executing market buy order...")
+                    order = self.exchange.create_market_buy_order(
+                        symbol=symbol,
+                        amount=quantity,
+                        params={
+                            'quoteOrderQty': required_usdt  # This ensures we use exact USDT amount
+                        }
                     )
                     
-                    # Place take profit order
-                    self.exchange.create_order(
-                        symbol,
-                        'limit',
-                        'sell',
-                        quantity,
-                        self.get_precise_quantity(float(take_profit_price), symbol)
-                    )
+                    print("\n✅ Buy order result:")
+                    print(f"Status: {order['status']}")
+                    print(f"Filled: {order.get('filled', 0)}")
+                    print(f"Cost: ${order.get('cost', 0):.2f}")
+                    
+                    # Verify the order was actually executed
+                    if order['status'] == 'closed' and order.get('filled', 0) > 0:
+                        print("Order successfully executed!")
+                        return order
+                    else:
+                        print("❌ Order was not filled")
+                        return None
+                        
+                except Exception as e:
+                    print(f"❌ Buy order failed: {str(e)}")
+                    return None
                     
             elif signal == "sell":
-                order = self.exchange.create_market_sell_order(
-                    symbol,
-                    quantity,
-                    params={
-                        'type': 'market'
-                    }
-                )
-            
-            # Update daily trade counter
-            self.daily_trades += 1
-            
-            # Log the trade
-            self.logger.info(f"Executed {signal} order: {json.dumps(order, indent=2)}")
-            print(f"Successfully executed {signal} order for {quantity} {symbol}")
-            
-            return order
-            
-        except ccxt.InsufficientFunds as e:
-            self.logger.error(f"Insufficient funds: {e}")
-            print(f"Error: Insufficient funds for {signal} trade")
+                # Check if we have the asset to sell
+                base_currency = symbol.split('/')[0]
+                available_asset = float(balance['free'].get(base_currency, 0))
+                
+                if available_asset < quantity:
+                    print(f"❌ Insufficient {base_currency} for sell order")
+                    return None
+                    
+                try:
+                    print("\n🚀 Executing market sell order...")
+                    order = self.exchange.create_market_sell_order(
+                        symbol=symbol,
+                        amount=quantity
+                    )
+                    
+                    print("\n✅ Sell order result:")
+                    print(f"Status: {order['status']}")
+                    print(f"Filled: {order.get('filled', 0)}")
+                    print(f"Cost: ${order.get('cost', 0):.2f}")
+                    
+                    if order['status'] == 'closed' and order.get('filled', 0) > 0:
+                        print("Order successfully executed!")
+                        return order
+                    else:
+                        print("❌ Order was not filled")
+                        return None
+                        
+                except Exception as e:
+                    print(f"❌ Sell order failed: {str(e)}")
+                    return None
+                    
+        except Exception as e:
+            print(f"❌ Unexpected error: {str(e)}")
             return None
+
+    # Add this new method to test trade execution
+    def test_market_order(self, signal):
+        """Test market order execution with minimum amount."""
+        symbol = self.config['trade_pair']
+        
+        try:
+            # Get market info
+            market = self.exchange.market(symbol)
+            ticker = self.exchange.fetch_ticker(symbol)
             
-        except ccxt.ExchangeError as e:
-            self.logger.error(f"Exchange error: {e}")
-            print(f"Exchange error: {e}")
+            # Calculate minimum order
+            min_amount = float(market['limits']['amount']['min'])
+            current_price = float(ticker['last'])
+            min_cost = min_amount * current_price
+            
+            print(f"\n🧪 Testing market order:")
+            print(f"Symbol: {symbol}")
+            print(f"Signal: {signal}")
+            print(f"Minimum amount: {min_amount} {symbol.split('/')[0]}")
+            print(f"Current price: ${current_price:.8f}")
+            print(f"Minimum cost: ${min_cost:.2f} USDT")
+            
+            # Get balance
+            balance = self.exchange.fetch_balance()
+            available_usdt = float(balance['free'].get('USDT', 0))
+            print(f"Available USDT: ${available_usdt:.2f}")
+            
+            if available_usdt < min_cost and signal == 'buy':
+                print("❌ Insufficient funds for test")
+                return None
+                
+            # Execute test order
+            try:
+                if signal == 'buy':
+                    print("\n🚀 Testing market buy...")
+                    order = self.exchange.create_market_buy_order(
+                        symbol,
+                        min_amount,
+                        params={'quoteOrderQty': min_cost}
+                    )
+                else:
+                    print("\n🚀 Testing market sell...")
+                    order = self.exchange.create_market_sell_order(
+                        symbol,
+                        min_amount
+                    )
+                
+                print("\n✅ Test order result:")
+                print(json.dumps(order, indent=2))
+                return order
+                
+            except Exception as e:
+                print(f"❌ Test order failed: {str(e)}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Test setup failed: {str(e)}")
             return None
+
+    def verify_trade_execution(self, order, symbol):
+        """Verify that a trade was actually executed."""
+        try:
+            if not order:
+                return False
+                
+            # Check order status
+            order_id = order['id']
+            fetched_order = self.exchange.fetch_order(order_id, symbol)
+            
+            if fetched_order['status'] == 'closed':
+                # Verify the trade in recent trades
+                trades = self.exchange.fetch_my_trades(symbol, limit=1)
+                if trades and trades[0]['order'] == order_id:
+                    return True
+                    
+            return False
             
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
-            print(f"Unexpected error: {e}")
-            return None
+            self.logger.error(f"Error verifying trade: {e}")
+            return False
 
     def cancel_all_orders(self, symbol):
         """Cancel all open orders for a symbol."""
