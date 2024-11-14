@@ -7,8 +7,10 @@ import pandas as pd
 import logging
 from datetime import datetime
 import ccxt
+import talib
 
-# Set up logging configuration first
+
+# Set up logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -19,13 +21,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load configuration from JSON file
+# Load configuration and define constants
 try:
     with open('config/config.json') as f:
         config = json.load(f)
     logger.info("Successfully loaded config")
     
-    # Define constants after config is loaded
+    # Define constants
     MIN_REQUIRED_BALANCE = float(config.get('initial_investment', 50))
     MIN_TRADE_BALANCE = float(config['trading_rules']['min_order_size'])
     
@@ -33,7 +35,7 @@ except Exception as e:
     logger.error(f"Error loading config: {str(e)}")
     sys.exit(1)
 
-# Import custom modules after config is loaded
+# Import custom modules
 from utils.data_fetcher import DataFetcher
 from strategies.moving_average_strategy import MovingAverageStrategy
 from scripts.openai_integration import AIBasedSignal
@@ -46,8 +48,33 @@ from pairs_manager import PairsManager
 from trading_chat import TradingChat
 from models.signal_model import SignalModel
 
+# Initialize global variables
+current_pair = config['trade_pair']
+running = False
+confidence_threshold = 0.7
+daily_trades = 0
+daily_loss = 0
+
+# Initialize components
+try:
+    fetcher = DataFetcher(config)
+    executor = TradeExecutor(config)  # Initialize executor here
+    ai_signal_generator = AIBasedSignal(config['openai_key'], fetcher, current_pair)
+    market_analyzer = MarketAnalyzer(fetcher)
+    data_exporter = MarketDataExporter(fetcher)
+    pairs_manager = PairsManager(fetcher, config)
+    trading_chat = TradingChat(ai_signal_generator, fetcher, pairs_manager)
+    signal_model = SignalModel(config)
+    logger.info("Successfully initialized all components")
+except Exception as e:
+    logger.error(f"Error initializing components: {str(e)}")
+    sys.exit(1)
+
+
+# Utility Functions
 def check_balance():
     """Check current balance and verify if it meets minimum requirements."""
+    global executor  # Ensures access to 'executor' defined in main script
     try:
         balance = executor.exchange.fetch_balance()
         available_balance = float(balance['free'].get('USDT', 0))
@@ -67,25 +94,56 @@ def check_balance():
         logger.error(f"Error checking balance: {e}")
         return None
 
-# Initialize global variables and components
-current_pair = config['trade_pair']
-running = False
-confidence_threshold = 0.7
-
-try:
-    # Initialize all components needed for the trading bot
-    fetcher = DataFetcher(config)
-    executor = TradeExecutor(config)
-    ai_signal_generator = AIBasedSignal(config['openai_key'], fetcher, current_pair)
-    market_analyzer = MarketAnalyzer(fetcher)
-    data_exporter = MarketDataExporter(fetcher)
-    pairs_manager = PairsManager(fetcher, config)
-    trading_chat = TradingChat(ai_signal_generator, fetcher, pairs_manager)
-    logger.info("Successfully initialized all components")
+def check_current_balance():
+    """Display detailed balance information."""
+    global executor, daily_trades, daily_loss  # Add executor here to ensure access
     
-except Exception as e:
-    logger.error(f"Error initializing components: {str(e)}")
-    sys.exit(1) # Exit the program if configuration fails to load
+    try:
+        balance = executor.exchange.fetch_balance()
+        available_usdt = float(balance['free'].get('USDT', 0))
+        total_usdt = float(balance['total'].get('USDT', 0))
+        
+        print("\n=== Current Balance Information ===")
+        print(f"Available USDT: ${available_usdt:.2f}")
+        print(f"Total USDT: ${total_usdt:.2f}")
+        
+        # Show current positions if any
+        current_pair_base = current_pair.split('/')[0]
+        if current_pair_base in balance['free']:
+            asset_balance = float(balance['free'][current_pair_base])
+            asset_total = float(balance['total'][current_pair_base])
+            try:
+                current_price = float(fetcher.get_latest_data(current_pair, granularity='1m', data_limit=1)['close'].iloc[-1])
+                print(f"\nCurrent {current_pair_base} Holdings:")
+                print(f"Available: {asset_balance:.8f} {current_pair_base}")
+                print(f"Total: {asset_total:.8f} {current_pair_base}")
+                print(f"Estimated Value: ${(asset_total * current_price):.2f} USDT")
+            except Exception as e:
+                logger.error(f"Error fetching current price: {e}")
+                print(f"\nCurrent {current_pair_base} Holdings:")
+                print(f"Available: {asset_balance:.8f} {current_pair_base}")
+                print(f"Total: {asset_total:.8f} {current_pair_base}")
+                print("Unable to estimate current value - price data unavailable")
+        
+        # Show daily trading stats
+        print("\nTrading Statistics:")
+        print(f"Daily Trades: {daily_trades}/{config['risk_management']['max_daily_trades']}")
+        max_daily_loss_amount = total_usdt * config['risk_management']['max_daily_loss']
+        print(f"Daily Loss: ${daily_loss:.2f} USDT (Max: ${max_daily_loss_amount:.2f} USDT)")
+        
+        # Show trading limits
+        print("\nTrading Limits:")
+        print(f"Minimum Order Size: ${config['trading_rules']['min_order_size']:.2f} USDT")
+        print(f"Maximum Order Size: ${config['trading_rules']['max_order_size']:.2f} USDT")
+        print(f"Maximum Position Size: {config['risk_management']['max_position_size'] * 100}% of balance")
+        
+        return available_usdt
+        
+    except Exception as e:
+        logger.error(f"Error checking balance: {e}")
+        print(f"Error: Unable to fetch balance information - {e}")
+        return None
+
 
 
 def view_market_data():
@@ -653,30 +711,50 @@ def trade_bot():
             time.sleep(timeframe_seconds)   
     
 def start_bot():
-    global running
+    global running, executor, daily_trades, daily_loss  # Add executor, daily_trades, and daily_loss here
+
     try:
+        # Initialize executor if not already done
+        if 'executor' not in globals() or executor is None:
+            executor = TradeExecutor(config)
+            logger.info("Trade executor initialized")
+
         # Check balance before starting
         balance_status = check_balance()
         if balance_status is None:
             print("\n❌ Error checking balance. Please verify your API connection.")
             return False
-        
+
         if not balance_status['sufficient']:
             print("\n⚠️ Insufficient funds to start trading!")
             print(f"Available balance: ${balance_status['available']:.2f} USDT")
             print(f"Minimum required: ${MIN_REQUIRED_BALANCE:.2f} USDT")
             print("\nPlease deposit funds before starting the trading bot.")
             return False
-        
+
         if not running:
+            # Reset daily counters
+            daily_trades = 0
+            daily_loss = 0
+            
+            # Start the bot
             running = True
             bot_thread = threading.Thread(target=trade_bot)
-            bot_thread.daemon = True
+            bot_thread.daemon = True  # Make thread daemon
             bot_thread.start()
+            
+            # Log and display success message
             logger.info(f"Trading bot started with ${balance_status['available']:.2f} USDT")
-            print(f"\nTrading bot started with {balance_status['available']:.2f} USDT")
+            print(f"\n✅ Trading bot started successfully!")
+            print(f"Available balance: ${balance_status['available']:.2f} USDT")
+            print(f"Daily trade limit: {config['risk_management']['max_daily_trades']} trades")
+            print(f"Stop loss: {config['risk_management']['stop_loss_percentage'] * 100}%")
+            print(f"Take profit: {config['risk_management']['take_profit_percentage'] * 100}%")
+            return True
+            
         else:
-            print("Trading bot is already running.")
+            print("\n⚠️ Trading bot is already running.")
+            return True
             
     except Exception as e:
         logger.error(f"Error starting bot: {e}")
@@ -767,64 +845,445 @@ def view_market_analysis():
     except Exception as e:
         logger.error(f"Error in view_market_analysis: {e}")
         print(f"Error performing market analysis: {e}")
-    
-def menu():
-    # Start background analysis when program starts
+
+
+def check_current_balance():
+    """Display detailed balance information."""
     try:
+        balance = executor.exchange.fetch_balance()
+        available_usdt = float(balance['free'].get('USDT', 0))
+        total_usdt = float(balance['total'].get('USDT', 0))
+        
+        print("\n=== Current Balance Information ===")
+        print(f"Available USDT: ${available_usdt:.2f}")
+        print(f"Total USDT: ${total_usdt:.2f}")
+        
+        # Show current positions if any
+        current_pair_base = current_pair.split('/')[0]
+        if current_pair_base in balance['free']:
+            asset_balance = float(balance['free'][current_pair_base])
+            asset_total = float(balance['total'][current_pair_base])
+            current_price = float(fetcher.get_latest_data(current_pair, granularity='1m', data_limit=1)['close'].iloc[-1])
+            
+            print(f"\nCurrent {current_pair_base} Holdings:")
+            print(f"Available: {asset_balance:.8f} {current_pair_base}")
+            print(f"Total: {asset_total:.8f} {current_pair_base}")
+            print(f"Estimated Value: ${(asset_total * current_price):.2f} USDT")
+        
+        # Show daily trading stats
+        print("\nTrading Limits:")
+        print(f"Daily Trades: {daily_trades}/{config['risk_management']['max_daily_trades']}")
+        print(f"Daily Loss: ${daily_loss:.2f} USDT (Max: ${total_usdt * config['risk_management']['max_daily_loss']:.2f} USDT)")
+        
+        return available_usdt
+        
+    except Exception as e:
+        logger.error(f"Error checking balance: {e}")
+        print(f"Error: Unable to fetch balance information - {e}")
+        return None  
+
+import logging
+
+# Set up logging to file and console
+logging.basicConfig(
+    filename='trading_bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("trading_bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def ai_trade_pilot():
+    """AI Trade Pilot for profit-focused trading with comprehensive analysis and feedback."""
+    global running, current_pair
+    pilot_running = True
+    last_trade_time = None
+    min_trade_interval = 300  # 5 minutes between trades
+    scan_count = 0
+    analyzed_pairs = set()
+    total_opportunities_found = 0
+    best_score_today = 0
+
+    def analyze_pair(symbol, data, pair_data):
+        """Detailed analysis of a trading pair."""
+        try:
+            logger.info(f"Starting analysis for {symbol}")
+            # Initialize analysis structure
+            analysis = {
+                'symbol': symbol,
+                'price': pair_data['price'],
+                'volume': pair_data['volume'],
+                'change_24h': pair_data['change_24h'],
+                'signals': {},
+                'indicators': {},
+                'risk_metrics': {},
+                'score': 0
+            }
+            
+            # Get all signals
+            signal_model_signal, signal_confidence = signal_model.generate_signal(data)
+            ai_signal = ai_signal_generator.get_ai_signal(data)
+            ai_confidence = ai_signal_generator.get_confidence(data)
+            
+            # Store signals in analysis
+            analysis['signals'] = {
+                'signal_model': {'signal': signal_model_signal, 'confidence': signal_confidence},
+                'ai': {'signal': ai_signal, 'confidence': ai_confidence}
+            }
+            logger.info(f"{symbol} - Signals: Signal Model={signal_model_signal} (Confidence={signal_confidence}), AI Signal={ai_signal} (Confidence={ai_confidence})")
+            
+            # Calculate technical indicators
+            closes = data['close'].values
+            volumes = data['volume'].values
+            
+            # RSI Analysis
+            rsi = talib.RSI(closes)[-1]
+            
+            # MACD
+            macd, signal, hist = talib.MACD(closes)
+            macd_signal = 'buy' if macd[-1] > signal[-1] else 'sell'
+            
+            # Bollinger Bands
+            upper, middle, lower = talib.BBANDS(closes)
+            bb_position = (closes[-1] - lower[-1]) / (upper[-1] - lower[-1])
+            
+            # Volume Analysis
+            volume_sma = np.mean(volumes)
+            volume_increase = volumes[-1] > volume_sma * 1.5
+            
+            # Trend Analysis
+            sma_20 = talib.SMA(closes, timeperiod=20)[-1]
+            sma_50 = talib.SMA(closes, timeperiod=50)[-1]
+            trend = 'uptrend' if sma_20 > sma_50 else 'downtrend'
+            
+            # Additional trend strength indicators
+            recent_trend = (closes[-1] - closes[-5]) / closes[-5] * 100  # 5-period trend
+
+            analysis['indicators'] = {
+                'rsi': rsi,
+                'macd_signal': macd_signal,
+                'bb_position': bb_position,
+                'volume_strength': volumes[-1] / volume_sma,
+                'trend': trend,
+                'trend_strength': abs(recent_trend),
+                'above_sma20': closes[-1] > sma_20,
+                'above_sma50': closes[-1] > sma_50
+            }
+            
+            # Risk Metrics
+            volatility = np.std(np.diff(closes) / closes[:-1]) * 100
+            avg_volume = np.mean(volumes)
+            price_momentum = (closes[-1] - closes[-10]) / closes[-10] * 100
+            
+            # Calculate support and resistance
+            recent_high = np.max(closes[-20:])
+            recent_low = np.min(closes[-20:])
+            
+            analysis['risk_metrics'] = {
+                'volatility': volatility,
+                'liquidity': pair_data['volume'] / avg_volume,
+                'momentum': price_momentum,
+                'distance_to_high': (recent_high - closes[-1]) / closes[-1] * 100,
+                'distance_to_low': (closes[-1] - recent_low) / closes[-1] * 100
+            }
+            
+            # Calculate overall score (0-100)
+            signal_score = (signal_confidence + ai_confidence) * 50  # 0-100
+            
+            technical_score = (
+                (50 - abs(rsi - 50)) / 50 * 25 +  # RSI closer to 50 is better
+                (bb_position if trend == 'uptrend' else (1 - bb_position)) * 25 +
+                (volume_increase * 25) +
+                (25 if macd_signal == signal_model_signal else 0)
+            )
+            
+            trend_score = (
+                (analysis['indicators']['trend_strength'] * 0.5) +  # Trend strength
+                (20 if trend == 'uptrend' else 0) +  # Uptrend bonus
+                (15 if analysis['indicators']['above_sma20'] else 0) +  # Above SMA20
+                (15 if analysis['indicators']['above_sma50'] else 0)  # Above SMA50
+            )
+            
+            # Calculate the final weighted score
+            analysis['score'] = (signal_score * 0.4 + technical_score * 0.4 + trend_score * 0.2)  # Weighted average
+            logger.info(f"Completed analysis for {symbol} with score {analysis['score']}")
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error analyzing {symbol}: {e}")
+            return None
+
+    def print_analysis(analysis):
+        """Print detailed analysis in a clear format."""
+        print(f"\n{'='*50}")
+        print(f"📊 Analysis for {analysis['symbol']}")
+        print(f"{'='*50}")
+        
+        print(f"\n💰 Price: ${analysis['price']:.8f}")
+        print(f"📈 24h Change: {analysis['change_24h']:+.2f}%")
+        print(f"📊 Volume: ${analysis['volume']:,.2f}")
+        
+        print("\n🎯 Trading Signals:")
+        print(f"Signal Model: {analysis['signals']['signal_model']['signal'].upper()} "
+              f"({analysis['signals']['signal_model']['confidence']*100:.1f}%)")
+        print(f"AI Signal: {analysis['signals']['ai']['signal'].upper()} "
+              f"({analysis['signals']['ai']['confidence']*100:.1f}%)")
+        
+        print("\n📈 Technical Indicators:")
+        print(f"RSI: {analysis['indicators']['rsi']:.1f}")
+        print(f"MACD Signal: {analysis['indicators']['macd_signal'].upper()}")
+        print(f"BB Position: {analysis['indicators']['bb_position']:.2f}")
+        print(f"Volume Strength: {analysis['indicators']['volume_strength']:.1f}x average")
+        print(f"Trend: {analysis['indicators']['trend'].upper()}")
+        
+        print("\n⚠️ Risk Analysis:")
+        print(f"Volatility: {analysis['risk_metrics']['volatility']:.2f}%")
+        print(f"Liquidity: {analysis['risk_metrics']['liquidity']:.1f}x average")
+        print(f"Momentum: {analysis['risk_metrics']['momentum']:+.2f}%")
+        print(f"Distance to High: {analysis['risk_metrics']['distance_to_high']:.2f}%")
+        print(f"Distance to Low: {analysis['risk_metrics']['distance_to_low']:.2f}%")
+        
+        print(f"\n📈 Overall Score: {analysis['score']:.1f}/100")
+        
+        # Trading recommendation
+        if analysis['score'] >= 75:
+            print("\n🟢 Strong Buy Opportunity")
+        elif analysis['score'] >= 65:
+            print("\n🟡 Potential Opportunity - Use Caution")
+        else:
+            print("\n🔴 Not Recommended")
+
+    def check_trade_safety(analysis):
+        """Verify if trade meets safety criteria."""
+        try:
+            # Check balance
+            balance_status = check_balance()
+            if not balance_status or not balance_status['can_trade']:
+                print("\n⚠️ Insufficient balance for trading!")
+                return False
+                
+            # Check minimum score
+            if analysis['score'] < 65:
+                print("\n⚠️ Score too low for safe trading")
+                return False
+                
+            # Check signal agreement
+            if (analysis['signals']['signal_model']['signal'] != 
+                analysis['signals']['ai']['signal']):
+                print("\n⚠️ Conflicting signals detected")
+                return False
+                
+            # Check trading interval
+            if (last_trade_time and 
+                time.time() - last_trade_time < min_trade_interval):
+                print("\n⚠️ Minimum trade interval not met")
+                return False
+                
+            # Check risk metrics
+            if analysis['risk_metrics']['volatility'] > 5:  # 5% volatility max
+                print("\n⚠️ Volatility too high")
+                return False
+                
+            if analysis['risk_metrics']['liquidity'] < 1.2:  # 20% above avg volume
+                print("\n⚠️ Insufficient liquidity")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in safety check: {e}")
+            return False
+
+    print("\n=== AI Trade Pilot Active ===")
+    logger.info("AI Trade Pilot started")
+
+    while pilot_running:
+        try:
+            scan_count += 1
+            print(f"\n🔄 Scan #{scan_count} Started")
+            logger.info(f"Starting Scan #{scan_count}")
+            
+            pairs = pairs_manager.get_sorted_pairs('volume')
+            
+            for pair_data in pairs[:10]:
+                try:
+                    symbol = pair_data['symbol']
+                    print(f"\n🔍 Analyzing {symbol}...")
+                    logger.info(f"Fetching data for {symbol}")
+                    data = fetcher.get_latest_data(symbol, granularity='1m', data_limit=50)
+                    
+                    if data is None:
+                        print(f"⚠️ Skipping {symbol} - No data available")
+                        logger.warning(f"No data available for {symbol}, skipping.")
+                        continue
+                    
+                    analysis = analyze_pair(symbol, data, pair_data)
+                    if analysis:
+                        print_analysis(analysis)
+                        if analysis['score'] >= 65 and check_trade_safety(analysis):
+                            signal = analysis['signals']['signal_model']['signal']
+                            price = analysis['price']
+                            logger.info(f"Executing trade for {symbol}: Signal={signal}, Price=${price}")
+                            execute_trade_with_safety(signal, price)
+                        else:
+                            print("\n⚠️ Trade skipped due to safety checks or low score.")
+                    
+                except Exception as e:
+                    logger.error(f"Error analyzing {symbol}: {e}")
+                    continue
+            
+            logger.info(f"Scan #{scan_count} completed.")
+            time.sleep(60)
+            
+        except KeyboardInterrupt:
+            print("\n⏹️ Stopping AI Trade Pilot...")
+            logger.info("AI Trade Pilot stopped by user.")
+            pilot_running = False
+            break
+            
+        except Exception as e:
+            logger.error(f"Error in AI Trade Pilot loop: {e}")
+            print(f"\n❌ Error: {e}")
+            time.sleep(60)
+
+
+
+
+## Menu
+def menu():
+    """Main menu for the trading bot."""
+    try:
+        # Start background analysis
         market_analyzer.start_analysis()
         logger.info("Background market analysis started")
+        print("\n✅ Market analysis started successfully")
     except Exception as e:
         logger.error(f"Failed to start market analysis: {e}")
-        print("Warning: Background market analysis failed to start")
-    
+        print("\n⚠️ Warning: Background market analysis failed to start")
+
     while True:
-        print("\n=== Trading Bot Menu by Victor Udeh ===")
-        print("1. Start Trading Bot")
-        print("2. Stop Trading Bot")
-        print("3. Change Trading Pair")
-        print("4. View Market Data")
-        print("5. AI Chat (Ask for insights)")
-        print("6. Export Data")
-        print("7. View Market Analysis")
-        print("8. Exit")
-            
+        print("\n" + "="*40)
+        print("=== Trading Bot Menu by Victor Udeh ===")
+        print("="*40)
+        print("1. 🚀 Start Trading Bot")
+        print("2. ⏹️ Stop Trading Bot")
+        print("3. 🔄 Change Trading Pair")
+        print("4. 📊 View Market Data")
+        print("5. 💬 AI Chat (Ask for insights)")
+        print("6. 📥 Export Data")
+        print("7. 📈 View Market Analysis")
+        print("8. 💰 Check Balance")
+        print("9. 🤖 Start AI Trade Pilot")
+        print("10. ❌ Exit")
+        print("-"*40)
+        
         choice = input("Enter your choice: ").strip()
-            
+        
         try:
             if choice == "1":
-                start_bot()
+                # Start bot with balance check
+                balance_status = check_balance()
+                if balance_status and balance_status['sufficient']:
+                    start_bot()
+                else:
+                    print("\n⚠️ Cannot start bot - insufficient funds!")
+                    print(f"Available: ${balance_status['available']:.2f} USDT")
+                    print(f"Required: ${MIN_REQUIRED_BALANCE:.2f} USDT")
+                    
             elif choice == "2":
-                stop_bot()
-            elif choice == "3":
-                change_pair()
-            elif choice == "4":
-                view_market_data()
-            elif choice == "5":
-                ai_chat()
-            elif choice == "6":
-                export_data()
-            elif choice == "7":
-                view_market_analysis()
-            elif choice == "8":
                 if running:
                     stop_bot()
+                    print("\n✅ Trading bot stopped successfully")
+                else:
+                    print("\n⚠️ Trading bot is not running")
+                    
+            elif choice == "3":
+                change_pair()
+                
+            elif choice == "4":
+                print("\n📊 Loading market data...")
+                view_market_data()
+                
+            elif choice == "5":
+                print("\n💬 Starting AI Chat...")
+                ai_chat()
+                
+            elif choice == "6":
+                print("\n📥 Export Data Options")
+                export_data()
+                
+            elif choice == "7":
+                print("\n📈 Loading market analysis...")
+                view_market_analysis()
+                
+            elif choice == "8":
+                print("\n💰 Checking balance...")
+                check_current_balance()
+                
+            elif choice == "9":
+                print("\n🤖 Starting AI Trade Pilot...")
+                balance_status = check_balance()
+                
+                if not balance_status or not balance_status['can_trade']:
+                    print("\n⚠️ Cannot start AI Trade Pilot - insufficient funds!")
+                    print(f"Available: ${balance_status['available']:.2f} USDT")
+                    continue
+                    
+                print("\n✅ Balance check passed")
+                print("Starting market analysis...")
+                
+                try:
+                    pilot_thread = threading.Thread(target=ai_trade_pilot)
+                    pilot_thread.daemon = True
+                    pilot_thread.start()
+                    
+                    print("\n🤖 AI Trade Pilot is now running")
+                    print("Press Enter to return to main menu")
+                    input()
+                    
+                except Exception as e:
+                    logger.error(f"Error starting AI Trade Pilot: {e}")
+                    print(f"\n❌ Error starting AI Trade Pilot: {e}")
+                
+            elif choice == "10":
+                if running:
+                    print("\n⏹️ Stopping trading bot...")
+                    stop_bot()
+                
+                print("\n🛑 Stopping market analysis...")
                 market_analyzer.stop_analysis()
                 logger.info("Trading bot shutting down")
-                print("Exiting the program.")
+                
+                print("\n✅ Trading bot shutdown complete")
+                print("Thank you for using the trading bot!")
                 break
+                
             else:
-                print("Invalid choice. Please enter a number from 1 to 8.")
+                print("\n❌ Invalid choice. Please enter a number between 1 and 10.")
+                
         except Exception as e:
             logger.error(f"Error in menu selection: {e}")
-            print(f"Error processing selection: {e}")
+            print(f"\n❌ Error processing selection: {e}")
             print("Please try again.")
-    
+
 if __name__ == "__main__":
     try:
+        print("\n" + "="*50)
+        print("Welcome to the AI Trading Bot by Victor Udeh")
+        print("="*50)
+        
         logger.info("Starting trading bot application...")
         menu()
+        
     except Exception as e:
         logger.error(f"Fatal error in main execution: {e}")
+        print(f"\n❌ Fatal error: {e}")
         sys.exit(1)
+        
     finally:
+        print("\nThank you for using the trading bot!")
         logger.info("Trading bot application terminated")
