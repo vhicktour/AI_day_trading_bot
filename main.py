@@ -282,6 +282,7 @@ def ai_chat():
                             since=since,
                             limit=100
                         )
+                        
                             
                         if ohlcv and len(ohlcv) > 0:
                             start_price = ohlcv[0][4]  # Closing price of the first candle
